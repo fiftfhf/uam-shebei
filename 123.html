@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#05070b;touch-action:none}
+  canvas{display:block;width:100vw;height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W = 0, H = 0;
+const WORLD = 1500;
+const VIEW_R = 200;
+const PLAYER_RANGE = 260;
+const VISION_HALF = Math.PI / 3;
+const ZOOM = 0.75;
+
+const DETECT_R = 280;
+const THREAT_R = 340;
+const THREAT_CD = 1;
+
+const MM_SIZE = 118;
+const MM_X = 12, MM_Y = 12;
+
+const ENEMY_FRONT_COUNT = 3;
+const ENEMY_FLANK_COUNT = 3;      // 绕后改为 3 人
+
+const ENEMY_ACCURACY = 0.85;
+const SHOT_LIFE = 0.22;
+const CRIT_CHANCE = 0.20;
+
+const FLANK_WAIT_R = 160;         // 距玩家多近算“绕后到位”
+const FLANK_TARGET_DIST = 90;     // 绕后目标点距玩家距离
+const FLANK_READY_RATIO = 0.6;
+const FLANK_GATHER_MAX = 4.0;
+
+let xrayOn = false;
+
+function resize(){ W = cv.width = innerWidth; H = cv.height = innerHeight; }
+addEventListener('resize', resize);
+resize();
+
+const rand = (a,b)=>a+Math.random()*(b-a);
+const dist = (a,b)=>Math.hypot(a.x-b.x, a.y-b.y);
+const angDiff = (a,b)=>{ let d = a-b; while (d>Math.PI) d-=Math.PI*2; while (d<-Math.PI) d+=Math.PI*2; return d; };
+
+class Unit {
+  constructor(x, y, team, role){
+    this.x = x; this.y = y;
+    this.team = team; this.role = role;
+    this.r = team === 'player' ? 15 : 13;
+    this.maxhp = team === 'player' ? 150 : 120;
+    this.hp = this.maxhp;
+    this.speed = team === 'player' ? 190 : 115;
+    this.cool = 0;
+    this.alive = true;
+    this.flankSide = Math.random() < 0.5 ? 1 : -1;
+    this.flankAngle = 0;
+    this.range = team === 'player' ? PLAYER_RANGE : VIEW_R;
+    this.fireRate = team === 'player' ? 0.15 : 0.5;
+    this.damage = team === 'player' ? 22 : 16;
+    this.facing = -Math.PI/2;
+    this.wander = { x: rand(80, WORLD-80), y: rand(80, WORLD-80) };
+    this.wanderT = rand(2, 5);
+    this.alerted = false;
+  }
+}
+
+let player, enemies, effects, leftJoy, rightJoy, gameover, win, lastTime, rocks, obstacles;
+let threat = { active:false, angle:0, timer:0, dist:0, pulse:0, units:[], shots:[] };
+let squadActive = false;
+let flankSquad = { phase: 'gather', timer: 0 };
+
+function spawnEnemy(role){
+  let x, y, t = 0;
+  do {
+    x = rand(80, WORLD-80);
+    y = rand(80, WORLD-80);
+    t++;
+  } while (t < 60 && Math.hypot(x-player.x, y-player.y) < 380);
+  return new Unit(x, y, 'enemy', role);
+}
+
+function buildObstacles(){
+  const list = [];
+  let tries = 0;
+  while (list.length < 7 && tries < 500){
+    tries++;
+    let w = rand(180, 280);
+    let h = rand(100, 175);
+    if (Math.random() < 0.5){ const t = w; w = h; h = t; }
+    const x = rand(70, WORLD - 70 - w);
+    const y = rand(70, WORLD - 70 - h);
+    const cx = x + w/2, cy = y + h/2;
+    if (Math.hypot(cx - WORLD/2, cy - WORLD/2) < 260) continue;
+    let ok = true;
+    for (const o of list){
+      if (x < o.x + o.w + 50 && x + w + 50 > o.x &&
+          y < o.y + o.h + 50 && y + h + 50 > o.y){ ok = false; break; }
+    }
+    if (!ok) continue;
+    list.push({ x, y, w, h });
+  }
+  return list;
+}
+
+function reset(){
+  player = new Unit(WORLD/2, WORLD/2, 'player', 'player');
+  enemies = [];
+  for (let i=0;i<ENEMY_FRONT_COUNT;i++) enemies.push(spawnEnemy('normal'));
+  for (let i=0;i<ENEMY_FLANK_COUNT;i++) enemies.push(spawnEnemy('flank'));
+
+  effects = [];
+  leftJoy  = { active:false, id:null, sx:0, sy:0, dx:0, dy:0 };
+  rightJoy = { active:false, id:null, sx:0, sy:0, dx:0, dy:0 };
+  gameover = false; win = false; lastTime = 0;
+
+  rocks = [];
+  for (let i=0;i<50;i++){
+    rocks.push({ x:rand(20,WORLD-20), y:rand(20,WORLD-20), r:rand(5,24), a:rand(0.02,0.06) });
+  }
+  obstacles = buildObstacles();
+  threat = { active:false, angle:0, timer:0, dist:0, pulse:0, units:[], shots:[] };
+  squadActive = false;
+  flankSquad = { phase: 'gather', timer: 0 };
+}
+reset();
+
+function clampUnit(u){
+  const m = u.r + 4;
+  u.x = Math.max(m, Math.min(WORLD-m, u.x));
+  u.y = Math.max(m, Math.min(WORLD-m, u.y));
+}
+
+function resolveObstacles(u){
+  for (const o of obstacles){
+    const nx = Math.max(o.x, Math.min(u.x, o.x + o.w));
+    const ny = Math.max(o.y, Math.min(u.y, o.y + o.h));
+    const dx = u.x - nx, dy = u.y - ny;
+    const d = Math.hypot(dx, dy);
+    if (d < u.r){
+      if (d < 1e-6){
+        const left = u.x - o.x;
+        const right = o.x + o.w - u.x;
+        const top = u.y - o.y;
+        const bottom = o.y + o.h - u.y;
+        const m = Math.min(left, right, top, bottom);
+        if (m === left) u.x = o.x - u.r;
+        else if (m === right) u.x = o.x + o.w + u.r;
+        else if (m === top) u.y = o.y - u.r;
+        else u.y = o.y + o.h + u.r;
+      } else {
+        const push = u.r - d;
+        u.x += dx / d * push;
+        u.y += dy / d * push;
+      }
+    }
+  }
+}
+
+function inCone(u, target, range=VIEW_R, half=VISION_HALF){
+  if (!target || !target.alive) return false;
+  const d = dist(u, target);
+  if (d > range) return false;
+  const ang = Math.atan2(target.y-u.y, target.x-u.x);
+  return Math.abs(angDiff(ang, u.facing)) <= half;
+}
+
+function raycastObstacle(x1, y1, dx, dy, maxT){
+  let bestT = maxT;
+  for (const o of obstacles){
+    let tmin = 0, tmax = maxT;
+    if (Math.abs(dx) < 1e-8){
+      if (x1 < o.x || x1 > o.x + o.w) continue;
+    } else {
+      let t1 = (o.x - x1) / dx;
+      let t2 = (o.x + o.w - x1) / dx;
+      if (t1 > t2){ const tmp = t1; t1 = t2; t2 = tmp; }
+      tmin = Math.max(tmin, t1);
+      tmax = Math.min(tmax, t2);
+      if (tmin > tmax) continue;
+    }
+    if (Math.abs(dy) < 1e-8){
+      if (y1 < o.y || y1 > o.y + o.h) continue;
+    } else {
+      let t1 = (o.y - y1) / dy;
+      let t2 = (o.y + o.h - y1) / dy;
+      if (t1 > t2){ const tmp = t1; t1 = t2; t2 = tmp; }
+      tmin = Math.max(tmin, t1);
+      tmax = Math.min(tmax, t2);
+      if (tmin > tmax) continue;
+    }
+    if (tmin < bestT) bestT = tmin;
+  }
+  return bestT;
+}
+
+function recordShot(e, x2, y2){
+  if (inCone(player, e)) return;
+  if (dist(e, player) > THREAT_R + 80) return;
+  threat.shots.push({ x1: e.x, y1: e.y, x2, y2, life: SHOT_LIFE });
+}
+
+function fireAt(u, target){
+  u.cool = u.fireRate;
+  target.hp -= u.damage;
+  effects.push({ x1:u.x, y1:u.y, x2:target.x, y2:target.y, life:0.09, color:'#ff6b6b', crit:false });
+  if (u.team === 'enemy') recordShot(u, target.x, target.y);
+  if (target.hp <= 0) target.alive = false;
+}
+
+function enemyMiss(e){
+  e.cool = e.fireRate;
+  const base = Math.atan2(player.y - e.y, player.x - e.x);
+  const off = (Math.random() < 0.5 ? 1 : -1) * rand(0.10, 0.22);
+  const ang = base + off;
+  const t = e.range;
+  const x2 = e.x + Math.cos(ang) * t;
+  const y2 = e.y + Math.sin(ang) * t;
+  effects.push({ x1:e.x, y1:e.y, x2, y2, life:0.07, color:'rgba(255,140,140,.55)', crit:false });
+  recordShot(e, x2, y2);
+}
+
+function shootRay(shooter, targets){
+  shooter.cool = shooter.fireRate;
+  const dx = Math.cos(shooter.facing), dy = Math.sin(shooter.facing);
+  let best = null, bestT = Infinity;
+
+  for (const t of targets){
+    if (!t.alive) continue;
+    const rx = t.x - shooter.x, ry = t.y - shooter.y;
+    const proj = rx*dx + ry*dy;
+    if (proj <= 0 || proj > shooter.range + t.r) continue;
+    const perp = Math.abs(rx*dy - ry*dx);
+    if (perp > t.r + 5) continue;
+    if (proj < bestT){ bestT = proj; best = t; }
+  }
+
+  const obsT = raycastObstacle(shooter.x, shooter.y, dx, dy, shooter.range);
+
+  if (obsT < bestT){
+    effects.push({ x1:shooter.x, y1:shooter.y,
+      x2:shooter.x + dx*obsT, y2:shooter.y + dy*obsT,
+      life:0.08, color:'rgba(200,205,215,.65)', crit:false });
+    return;
+  }
+
+  if (best){
+    const isPlayerShot = shooter.team === 'player';
+    const crit = isPlayerShot && Math.random() < CRIT_CHANCE;
+
+    if (crit){
+      best.hp = 0;
+      best.alive = false;
+      effects.push({ x1:shooter.x, y1:shooter.y, x2:best.x, y2:best.y,
+        life:0.14, color:'#ffe066', crit:true });
+    } else {
+      best.hp -= shooter.damage;
+      effects.push({ x1:shooter.x, y1:shooter.y, x2:best.x, y2:best.y,
+        life:0.09, color:'#7ef9ff', crit:false });
+      if (best.hp <= 0) best.alive = false;
+    }
+  } else {
+    effects.push({ x1:shooter.x, y1:shooter.y,
+      x2:shooter.x + dx*shooter.range, y2:shooter.y + dy*shooter.range,
+      life:0.05, color:'rgba(126,249,255,.35)', crit:false });
+  }
+}
+
+function separate(){
+  const all = [player, ...enemies].filter(u => u.alive);
+  for (let i=0;i<all.length;i++){
+    for (let j=i+1;j<all.length;j++){
+      const a = all[i], b = all[j];
+      const dx = b.x-a.x, dy = b.y-a.y;
+      const d = Math.hypot(dx,dy) || 0.01;
+      const min = a.r + b.r;
+      if (d < min){
+        const push = (min-d)/2;
+        const nx = dx/d, ny = dy/d;
+        a.x -= nx*push; a.y -= ny*push;
+        b.x += nx*push; b.y += ny*push;
+      }
+    }
+  }
+  all.forEach(u => { resolveObstacles(u); clampUnit(u); });
+}
+
+// 修复：警报时必须把所有敌人 alerted 设为 true
+function alertAll(){
+  if (squadActive) return;
+  squadActive = true;
+
+  for (const e of enemies){
+    if (e.alive) e.alerted = true;
+  }
+
+  const baseAng = rand(0, Math.PI * 2);
+  const flanks = enemies.filter(e => e.alive && e.role === 'flank');
+  flanks.forEach((e, i) => {
+    e.flankAngle = baseAng + (i / Math.max(1, flanks.length)) * Math.PI * 2 + rand(-0.2, 0.2);
+  });
+
+  flankSquad.phase = 'gather';
+  flankSquad.timer = 0;
+}
+
+function perception(dt){
+  if (squadActive) return;
+  for (const e of enemies){
+    if (!e.alive) continue;
+    const d = dist(e, player);
+    if (d < DETECT_R || inCone(e, player)){
+      alertAll();
+      return;
+    }
+  }
+}
+
+function updateFlankSquad(dt){
+  if (!squadActive || flankSquad.phase !== 'gather') return;
+  flankSquad.timer += dt;
+
+  const flanks = enemies.filter(e => e.alive && e.role === 'flank');
+  if (flanks.length === 0){
+    flankSquad.phase = 'attack';
+    return;
+  }
+
+  let ready = 0;
+  for (const e of flanks){
+    if (dist(e, player) < FLANK_WAIT_R + 20) ready++;
+  }
+
+  if (ready / flanks.length >= FLANK_READY_RATIO || flankSquad.timer > FLANK_GATHER_MAX){
+    flankSquad.phase = 'attack';
+  }
+}
+
+function updateThreat(dt){
+  threat.pulse = Math.max(0, threat.pulse - dt * 2.2);
+  threat.timer -= dt;
+
+  threat.shots.forEach(s => s.life -= dt);
+  threat.shots = threat.shots.filter(s => s.life > 0);
+
+  if (threat.timer > 0) return;
+  threat.timer = THREAT_CD;
+
+  const units = [];
+  let best = null, bd = 1e9;
+  for (const e of enemies){
+    if (!e.alive) continue;
+    const d = dist(player, e);
+    if (d < bd){ bd = d; best = e; }
+    if (d < THREAT_R) units.push({ enemy: e, x: e.x, y: e.y, alerted: e.alerted });
+  }
+  threat.units = units;
+
+  if (best && bd < THREAT_R){
+    threat.active = true;
+    threat.angle = Math.atan2(best.y - player.y, best.x - player.x);
+    threat.dist = bd;
+    threat.pulse = 1;
+  } else {
+    threat.active = false;
+  }
+}
+
+function update(dt){
+  if (gameover || win) return;
+
+  if (leftJoy.active){
+    const maxR = 62;
+    let dx = leftJoy.dx, dy = leftJoy.dy;
+    const d = Math.hypot(dx, dy);
+    if (d > maxR){ dx = dx/d*maxR; dy = dy/d*maxR; }
+    if (d > 6){
+      player.x += dx/maxR * player.speed * dt;
+      player.y += dy/maxR * player.speed * dt;
+      resolveObstacles(player);
+      clampUnit(player);
+      if (!rightJoy.active) player.facing = Math.atan2(dy, dx);
+    }
+  }
+
+  if (rightJoy.active){
+    const d = Math.hypot(rightJoy.dx, rightJoy.dy);
+    if (d > 6) player.facing = Math.atan2(rightJoy.dy, rightJoy.dx);
+
+    player.cool -= dt;
+    if (player.cool <= 0) shootRay(player, enemies);
+  } else {
+    player.cool = Math.max(0, player.cool - dt);
+  }
+
+  perception(dt);
+  updateFlankSquad(dt);
+
+  for (const e of enemies){
+    if (!e.alive) continue;
+    const dToP = dist(e, player);
+
+    if (!e.alerted){
+      e.wanderT -= dt;
+      if (e.wanderT <= 0 || dist(e, e.wander) < 24){
+        e.wander = { x: rand(80, WORLD-80), y: rand(80, WORLD-80) };
+        e.wanderT = rand(2.5, 6);
+      }
+      const dx = e.wander.x - e.x, dy = e.wander.y - e.y;
+      const d2 = Math.hypot(dx, dy);
+      if (d2 > 4){
+        e.x += dx / d2 * e.speed * 0.65 * dt;
+        e.y += dy / d2 * e.speed * 0.65 * dt;
+        resolveObstacles(e);
+        clampUnit(e);
+        e.facing = Math.atan2(dy, dx);
+      }
+      e.cool = Math.max(0, e.cool - dt);
+      continue;
+    }
+
+    const seenByPlayer = inCone(player, e);
+    const inShootRange = dToP < e.range + 30;
+
+    if (e.role === 'flank'){
+      const speed = seenByPlayer ? 110 : 180;
+
+      if (flankSquad.phase === 'gather'){
+        // 距玩家还远：绕向自己的侧翼目标点；已进入等待圈：停下面向玩家
+        if (dToP > FLANK_WAIT_R){
+          const tx = player.x + Math.cos(e.flankAngle) * FLANK_TARGET_DIST;
+          const ty = player.y + Math.sin(e.flankAngle) * FLANK_TARGET_DIST;
+          const mx = tx - e.x, my = ty - e.y;
+          const md = Math.hypot(mx, my);
+          if (md > 6){
+            e.x += mx / md * speed * dt;
+            e.y += my / md * speed * dt;
+            resolveObstacles(e);
+            clampUnit(e);
+          }
+          e.facing = inShootRange
+            ? Math.atan2(player.y - e.y, player.x - e.x)
+            : (md > 0.001 ? Math.atan2(my, mx) : e.facing);
+        } else {
+          // 到位等待，但朝玩家，射程内可开火
+          e.facing = Math.atan2(player.y - e.y, player.x - e.x);
+        }
+      } else {
+        // 进攻阶段：绕后组一起压上
+        if (dToP > 80){
+          const dx = player.x - e.x, dy = player.y - e.y;
+          const d2 = Math.hypot(dx, dy) || 1;
+          e.x += dx / d2 * speed * dt;
+          e.y += dy / d2 * speed * dt;
+          resolveObstacles(e);
+          clampUnit(e);
+        }
+        e.facing = Math.atan2(player.y - e.y, player.x - e.x);
+      }
+    } else {
+      // 正面：直接压上，不等队友
+      e.facing = Math.atan2(player.y - e.y, player.x - e.x);
+      if (dToP > 120){
+        const dx = player.x - e.x, dy = player.y - e.y;
+        const d2 = Math.hypot(dx, dy) || 1;
+        e.x += dx / d2 * e.speed * dt;
+        e.y += dy / d2 * e.speed * dt;
+        resolveObstacles(e);
+        clampUnit(e);
+      }
+    }
+
+    e.cool -= dt;
+    if (e.cool <= 0 && inCone(e, player, e.range)){
+      const dx = player.x - e.x, dy = player.y - e.y;
+      const dd = Math.hypot(dx, dy) || 1;
+      const obsT = raycastObstacle(e.x, e.y, dx/dd, dy/dd, dd);
+      if (obsT >= dd - 2){
+        if (Math.random() < ENEMY_ACCURACY) fireAt(e, player);
+        else enemyMiss(e);
+      } else {
+        e.cool = e.fireRate * 0.5;
+      }
+    }
+  }
+
+  separate();
+  enemies = enemies.filter(e => e.alive);
+  effects.forEach(fx => fx.life -= dt);
+  effects = effects.filter(fx => fx.life > 0);
+
+  updateThreat(dt);
+
+  if (!player.alive) gameover = true;
+  if (enemies.length === 0) win = true;
+}
+
+// ===== 绘制 =====
+function drawUnit(u){
+  ctx.beginPath();
+  ctx.moveTo(u.x, u.y);
+  ctx.arc(u.x, u.y, VIEW_R, u.facing-VISION_HALF, u.facing+VISION_HALF);
+  ctx.closePath();
+  const isPlayer = u.team === 'player';
+  ctx.fillStyle = isPlayer ? 'rgba(100,180,255,0.10)' : 'rgba(255,80,80,0.09)';
+  ctx.fill();
+  ctx.strokeStyle = isPlayer ? 'rgba(100,200,255,0.5)' : 'rgba(255,90,90,0.28)';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(u.x, u.y, u.r, 0, Math.PI*2);
+  if (isPlayer) ctx.fillStyle = '#4da3ff';
+  else ctx.fillStyle = u.role === 'flank' ? '#ff9f43' : '#ff5c5c';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.8)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(u.x + Math.cos(u.facing)*u.r, u.y + Math.sin(u.facing)*u.r);
+  ctx.lineTo(u.x + Math.cos(u.facing)*(u.r+10), u.y + Math.sin(u.facing)*(u.r+10));
+  ctx.strokeStyle = 'rgba(255,255,255,.85)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  const w = u.r*2.4, h = 4;
+  const x = u.x - w/2, y = u.y - u.r - 10;
+  ctx.fillStyle = 'rgba(0,0,0,.6)';
+  ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = isPlayer ? '#5cff9d' : '#ff5c5c';
+  ctx.fillRect(x, y, w * Math.max(0, u.hp/u.maxhp), h);
+
+  if (!isPlayer && u.alerted){
+    ctx.fillStyle = 'rgba(255,180,80,0.85)';
+    ctx.font = 'bold 14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('!', u.x, u.y - u.r - 14);
+  }
+}
+
+function drawObstacles(){
+  for (const o of obstacles){
+    if (o.x > player.x + W/ZOOM || o.x + o.w < player.x - W/ZOOM ||
+        o.y > player.y + H/ZOOM || o.y + o.h < player.y - H/ZOOM) continue;
+    ctx.fillStyle = 'rgba(42,54,74,0.95)';
+    ctx.fillRect(o.x, o.y, o.w, o.h);
+    ctx.strokeStyle = 'rgba(100,150,200,0.32)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(o.x, o.y, o.w, o.h);
+    ctx.strokeStyle = 'rgba(120,170,220,0.10)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(o.x + 10, o.y + 10, o.w - 20, o.h - 20);
+  }
+}
+
+function drawThreat(){
+  if (!threat.active) return;
+  const cx = W / 2, cy = H / 2;
+  const dx = Math.cos(threat.angle), dy = Math.sin(threat.angle);
+  let t = Infinity;
+  if (dx > 0.0001) t = Math.min(t, (W - cx) / dx);
+  else if (dx < -0.0001) t = Math.min(t, -cx / dx);
+  if (dy > 0.0001) t = Math.min(t, (H - cy) / dy);
+  else if (dy < -0.0001) t = Math.min(t, -cy / dy);
+  const px = cx + dx * t * 0.93;
+  const py = cy + dy * t * 0.93;
+
+  const nearness = Math.max(0, 1 - threat.dist / THREAT_R);
+  const alpha = 0.35 + nearness * 0.4 + threat.pulse * 0.25;
+
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(threat.angle);
+  ctx.beginPath();
+  ctx.moveTo(9, 0);
+  ctx.lineTo(-4, -5);
+  ctx.lineTo(-4, 5);
+  ctx.closePath();
+  ctx.fillStyle = `rgba(255,95,95,${alpha})`;
+  ctx.fill();
+
+  if (threat.pulse > 0.01){
+    ctx.beginPath();
+    ctx.arc(0, 0, 12 * (1.4 - threat.pulse * 0.4), 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(255,120,120,${threat.pulse * 0.45})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawEnemyMarkers(){
+  const tnow = performance.now() / 1000;
+  for (const m of threat.units){
+    if (!m.enemy.alive) continue;
+    if (inCone(player, m.enemy)) continue;
+
+    const sx = W/2 + (m.x - player.x) * ZOOM;
+    const sy = H/2 + (m.y - player.y) * ZOOM;
+    if (sx < -20 || sx > W + 20 || sy < -20 || sy > H + 20) continue;
+
+    const pulse = 0.5 + 0.5 * Math.sin(tnow * 6 + m.x * 0.01);
+
+    ctx.beginPath();
+    ctx.arc(sx, sy, 4, 0, Math.PI*2);
+    ctx.fillStyle = m.alerted
+      ? `rgba(255,80,80,${0.55 + pulse * 0.3})`
+      : 'rgba(255,110,110,0.5)';
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(sx, sy, 8, 0, Math.PI*2);
+    ctx.strokeStyle = m.alerted
+      ? `rgba(255,140,140,${0.25 + pulse * 0.25})`
+      : 'rgba(255,140,140,0.22)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+}
+
+function drawEnemyShots(){
+  for (const s of threat.shots){
+    const a = Math.max(0, s.life / SHOT_LIFE);
+    const sx1 = W/2 + (s.x1 - player.x) * ZOOM;
+    const sy1 = H/2 + (s.y1 - player.y) * ZOOM;
+    const sx2 = W/2 + (s.x2 - player.x) * ZOOM;
+    const sy2 = H/2 + (s.y2 - player.y) * ZOOM;
+
+    ctx.strokeStyle = `rgba(255,120,120,${a * 0.85})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(sx1, sy1);
+    ctx.lineTo(sx2, sy2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(sx1, sy1, 2.5, 0, Math.PI*2);
+    ctx.fillStyle = `rgba(255,150,150,${a * 0.7})`;
+    ctx.fill();
+  }
+}
+
+function xrayBtnRect(){
+  return { x: W - 12 - 74, y: 12, w: 74, h: 30 };
+}
+
+function drawMinimap(){
+  const s = MM_SIZE / WORLD;
+  ctx.save();
+
+  ctx.fillStyle = 'rgba(8,14,22,0.82)';
+  ctx.fillRect(MM_X, MM_Y, MM_SIZE, MM_SIZE);
+  ctx.strokeStyle = 'rgba(120,180,255,.5)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(MM_X, MM_Y, MM_SIZE, MM_SIZE);
+
+  ctx.fillStyle = 'rgba(80,100,130,0.5)';
+  for (const o of obstacles){
+    ctx.fillRect(MM_X + o.x*s, MM_Y + o.y*s, o.w*s, o.h*s);
+  }
+
+  ctx.strokeStyle = 'rgba(120,170,255,.08)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 1; i < 4; i++){
+    ctx.moveTo(MM_X + MM_SIZE*i/4, MM_Y);
+    ctx.lineTo(MM_X + MM_SIZE*i/4, MM_Y + MM_SIZE);
+    ctx.moveTo(MM_X, MM_Y + MM_SIZE*i/4);
+    ctx.lineTo(MM_X + MM_SIZE, MM_Y + MM_SIZE*i/4);
+  }
+  ctx.stroke();
+
+  if (xrayOn){
+    for (const e of enemies){
+      if (!e.alive) continue;
+      const x = MM_X + e.x * s;
+      const y = MM_Y + e.y * s;
+      ctx.beginPath();
+      ctx.arc(x, y, 2.2, 0, Math.PI*2);
+      ctx.fillStyle = e.role === 'flank'
+        ? 'rgba(120,220,255,0.85)'
+        : 'rgba(150,200,255,0.75)';
+      ctx.fill();
+    }
+  }
+
+  for (const sh of threat.shots){
+    const a = Math.max(0, sh.life / SHOT_LIFE);
+    ctx.strokeStyle = `rgba(255,120,120,${a * 0.9})`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(MM_X + sh.x1*s, MM_Y + sh.y1*s);
+    ctx.lineTo(MM_X + sh.x2*s, MM_Y + sh.y2*s);
+    ctx.stroke();
+  }
+
+  for (const m of threat.units){
+    if (!m.enemy.alive) continue;
+    const x = MM_X + m.x * s;
+    const y = MM_Y + m.y * s;
+
+    ctx.beginPath();
+    ctx.arc(x, y, m.alerted ? 2.8 : 2, 0, Math.PI*2);
+    ctx.fillStyle = m.alerted ? 'rgba(255,80,80,0.95)' : 'rgba(255,110,110,0.5)';
+    ctx.fill();
+
+    if (m.alerted){
+      ctx.beginPath();
+      ctx.arc(x, y, 5.5, 0, Math.PI*2);
+      ctx.strokeStyle = 'rgba(255,90,90,0.35)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+  }
+
+  const px = MM_X + player.x * s;
+  const py = MM_Y + player.y * s;
+
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(player.facing);
+  ctx.beginPath();
+  ctx.moveTo(8, 0);
+  ctx.lineTo(-4.5, -5);
+  ctx.lineTo(-4.5, 5);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(120,200,255,0.22)';
+  ctx.fill();
+  ctx.restore();
+
+  ctx.beginPath();
+  ctx.arc(px, py, 3.2, 0, Math.PI*2);
+  ctx.fillStyle = '#4da3ff';
+  ctx.fill();
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+function drawXrayButton(){
+  const b = xrayBtnRect();
+  ctx.fillStyle = xrayOn ? 'rgba(80,200,255,0.25)' : 'rgba(255,255,255,0.08)';
+  ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.strokeStyle = xrayOn ? 'rgba(120,220,255,0.85)' : 'rgba(255,255,255,0.28)';
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(b.x, b.y, b.w, b.h);
+
+  ctx.fillStyle = xrayOn ? '#8fe3ff' : 'rgba(255,255,255,0.65)';
+  ctx.font = 'bold 13px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(xrayOn ? '透视 ON' : '透视 OFF', b.x + b.w/2, b.y + b.h/2);
+  ctx.textBaseline = 'alphabetic';
+  ctx.textAlign = 'left';
+}
+
+function draw(){
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.translate(W/2, H/2);
+  ctx.scale(ZOOM, ZOOM);
+  ctx.translate(-player.x, -player.y);
+
+  ctx.fillStyle = '#0b1018';
+  ctx.fillRect(0, 0, WORLD, WORLD);
+
+  const g = 80;
+  const halfW = W/ZOOM/2, halfH = H/ZOOM/2;
+  const gx0 = Math.floor((player.x - halfW)/g)*g;
+  const gy0 = Math.floor((player.y - halfH)/g)*g;
+  const gx1 = player.x + halfW, gy1 = player.y + halfH;
+  ctx.strokeStyle = 'rgba(120,170,255,.05)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x=gx0; x<gx1+g; x+=g){ ctx.moveTo(x, gy0); ctx.lineTo(x, gy1); }
+  for (let y=gy0; y<gy1+g; y+=g){ ctx.moveTo(gx0, y); ctx.lineTo(gx1, y); }
+  ctx.stroke();
+
+  for (const r of rocks){
+    if (Math.abs(r.x-player.x) > halfW+40 || Math.abs(r.y-player.y) > halfH+40) continue;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r, 0, Math.PI*2);
+    ctx.fillStyle = `rgba(140,170,220,${r.a})`;
+    ctx.fill();
+  }
+
+  drawObstacles();
+
+  ctx.strokeStyle = 'rgba(120,180,255,.4)';
+  ctx.lineWidth = 6;
+  ctx.strokeRect(0, 0, WORLD, WORLD);
+
+  for (const fx of effects){
+    ctx.globalAlpha = Math.max(0, fx.life/0.09);
+    ctx.strokeStyle = fx.color;
+    ctx.lineWidth = fx.crit ? 4 : 2;
+    ctx.beginPath();
+    ctx.moveTo(fx.x1, fx.y1);
+    ctx.lineTo(fx.x2, fx.y2);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  for (const e of enemies){
+    if (inCone(player, e)) drawUnit(e);
+  }
+
+  drawUnit(player);
+  ctx.restore();
+
+  drawVisionMask();
+  drawEnemyShots();
+  drawEnemyMarkers();
+  drawThreat();
+  drawMinimap();
+  drawXrayButton();
+
+  const hudY = MM_Y + MM_SIZE + 22;
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 16px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText(`敌人: ${enemies.length}`, 16, hudY);
+  ctx.fillText(`HP: ${Math.max(0, Math.ceil(player.hp))}`, 16, hudY + 24);
+
+  drawJoy(leftJoy, 'rgba(77,163,255,.8)');
+  drawJoy(rightJoy, 'rgba(255,140,80,.85)');
+
+  if (gameover || win){
+    ctx.fillStyle = 'rgba(0,0,0,.75)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = win ? '#5cff9d' : '#ff6b6b';
+    ctx.font = 'bold 42px sans-serif';
+    ctx.fillText(win ? '胜利' : '失败', W/2, H/2 - 10);
+    ctx.fillStyle = '#fff';
+    ctx.font = '17px sans-serif';
+    ctx.fillText('点击屏幕重新开始', W/2, H/2 + 36);
+  }
+}
+
+function drawVisionMask(){
+  const sx = W/2, sy = H/2;
+  const r = VIEW_R * ZOOM;
+
+  const path = new Path2D();
+  path.rect(0, 0, W, H);
+  path.moveTo(sx, sy);
+  path.arc(sx, sy, r, player.facing - VISION_HALF, player.facing + VISION_HALF);
+  path.closePath();
+
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.86)';
+  ctx.fill(path, 'evenodd');
+  ctx.restore();
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(sx, sy);
+  ctx.arc(sx, sy, r, player.facing - VISION_HALF, player.facing + VISION_HALF);
+  ctx.closePath();
+  ctx.clip();
+  const grad = ctx.createRadialGradient(sx, sy, r*0.55, sx, sy, r);
+  grad.addColorStop(0, 'rgba(0,0,0,0)');
+  grad.addColorStop(1, 'rgba(0,0,0,0.55)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(sx-r, sy-r, r*2, r*2);
+  ctx.restore();
+}
+
+function drawJoy(joy, color){
+  const bx = joy.active ? joy.sx : (joy === leftJoy ? 90 : W - 90);
+  const by = joy.active ? joy.sy : H - 110;
+  ctx.beginPath();
+  ctx.arc(bx, by, 62, 0, Math.PI*2);
+  ctx.fillStyle = 'rgba(255,255,255,.06)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.22)';
+  ctx.stroke();
+
+  if (joy.active){
+    let dx = joy.dx, dy = joy.dy;
+    const d = Math.hypot(dx, dy);
+    const maxR = 62;
+    if (d > maxR){ dx = dx/d*maxR; dy = dy/d*maxR; }
+    ctx.beginPath();
+    ctx.arc(bx + dx, by + dy, 26, 0, Math.PI*2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+}
+
+function loop(t){
+  if (!lastTime) lastTime = t;
+  const dt = Math.min(0.05, (t-lastTime)/1000);
+  lastTime = t;
+  update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ===== 双摇杆输入 =====
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+
+  const b = xrayBtnRect();
+  if (e.clientX >= b.x && e.clientX <= b.x + b.w &&
+      e.clientY >= b.y && e.clientY <= b.y + b.h){
+    xrayOn = !xrayOn;
+    return;
+  }
+
+  if (gameover || win){ reset(); return; }
+  const isLeft = e.clientX < W/2;
+  const joy = isLeft ? leftJoy : rightJoy;
+  if (joy.active) return;
+  joy.active = true;
+  joy.id = e.pointerId;
+  joy.sx = e.clientX;
+  joy.sy = e.clientY;
+  joy.dx = 0; joy.dy = 0;
+  cv.setPointerCapture(e.pointerId);
+});
+
+cv.addEventListener('pointermove', e => {
+  const joy = leftJoy.id === e.pointerId ? leftJoy :
+              (rightJoy.id === e.pointerId ? rightJoy : null);
+  if (!joy) return;
+  e.preventDefault();
+  joy.dx = e.clientX - joy.sx;
+  joy.dy = e.clientY - joy.sy;
+});
+
+function endPointer(e){
+  for (const joy of [leftJoy, rightJoy]){
+    if (joy.id === e.pointerId){
+      joy.active = false;
+      joy.id = null;
+      joy.dx = 0; joy.dy = 0;
+    }
+  }
+}
+cv.addEventListener('pointerup', endPointer);
+cv.addEventListener('pointercancel', endPointer);
+</script>
+</body>
+</html>
