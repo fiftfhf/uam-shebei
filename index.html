@@ -16,9 +16,9 @@ const ctx = cv.getContext('2d');
 let W = 0, H = 0;
 const WORLD = 1500;
 const VIEW_R = 200;
-const PLAYER_RANGE = 260;
+const PLAYER_RANGE = 280;
 const VISION_HALF = Math.PI / 3;
-const ZOOM = 0.75;
+const ZOOM = 0.3;
 
 const DETECT_R = 280;
 const THREAT_R = 340;
@@ -28,18 +28,19 @@ const MM_SIZE = 118;
 const MM_X = 12, MM_Y = 12;
 
 const ENEMY_FRONT_COUNT = 3;
-const ENEMY_FLANK_COUNT = 3;      // 绕后改为 3 人
+const ENEMY_FLANK_COUNT = 3;
 
 const ENEMY_ACCURACY = 0.85;
 const SHOT_LIFE = 0.22;
 const CRIT_CHANCE = 0.20;
 
-const FLANK_WAIT_R = 160;         // 距玩家多近算“绕后到位”
-const FLANK_TARGET_DIST = 90;     // 绕后目标点距玩家距离
+const FLANK_WAIT_R = 160;
+const FLANK_TARGET_DIST = 90;
 const FLANK_READY_RATIO = 0.6;
 const FLANK_GATHER_MAX = 4.0;
 
 let xrayOn = false;
+let aimbotOn = false;       // 自瞄开关
 
 function resize(){ W = cv.width = innerWidth; H = cv.height = innerHeight; }
 addEventListener('resize', resize);
@@ -291,7 +292,6 @@ function separate(){
   all.forEach(u => { resolveObstacles(u); clampUnit(u); });
 }
 
-// 修复：警报时必须把所有敌人 alerted 设为 true
 function alertAll(){
   if (squadActive) return;
   squadActive = true;
@@ -375,6 +375,7 @@ function updateThreat(dt){
 function update(dt){
   if (gameover || win) return;
 
+  // 移动
   if (leftJoy.active){
     const maxR = 62;
     let dx = leftJoy.dx, dy = leftJoy.dy;
@@ -385,14 +386,41 @@ function update(dt){
       player.y += dy/maxR * player.speed * dt;
       resolveObstacles(player);
       clampUnit(player);
-      if (!rightJoy.active) player.facing = Math.atan2(dy, dx);
     }
   }
 
-  if (rightJoy.active){
-    const d = Math.hypot(rightJoy.dx, rightJoy.dy);
-    if (d > 6) player.facing = Math.atan2(rightJoy.dy, rightJoy.dx);
+  // 查找自瞄目标
+  let aimbotTarget = null;
+  if (aimbotOn) {
+    let minDist = Infinity;
+    for (const e of enemies) {
+      if (!e.alive) continue;
+      const d = dist(player, e);
+      // 只锁定射程内的敌人
+      if (d <= player.range + e.r && d < minDist) {
+        minDist = d;
+        aimbotTarget = e;
+      }
+    }
+  }
 
+  // 朝向逻辑
+  if (aimbotTarget) {
+    // 自瞄锁定
+    player.facing = Math.atan2(aimbotTarget.y - player.y, aimbotTarget.x - player.x);
+  } else {
+    // 手动瞄准或移动朝向
+    if (rightJoy.active) {
+      const d = Math.hypot(rightJoy.dx, rightJoy.dy);
+      if (d > 6) player.facing = Math.atan2(rightJoy.dy, rightJoy.dx);
+    } else if (leftJoy.active) {
+      const d = Math.hypot(leftJoy.dx, leftJoy.dy);
+      if (d > 6) player.facing = Math.atan2(leftJoy.dy, leftJoy.dx);
+    }
+  }
+
+  // 开火
+  if (rightJoy.active){
     player.cool -= dt;
     if (player.cool <= 0) shootRay(player, enemies);
   } else {
@@ -432,7 +460,6 @@ function update(dt){
       const speed = seenByPlayer ? 110 : 180;
 
       if (flankSquad.phase === 'gather'){
-        // 距玩家还远：绕向自己的侧翼目标点；已进入等待圈：停下面向玩家
         if (dToP > FLANK_WAIT_R){
           const tx = player.x + Math.cos(e.flankAngle) * FLANK_TARGET_DIST;
           const ty = player.y + Math.sin(e.flankAngle) * FLANK_TARGET_DIST;
@@ -448,11 +475,9 @@ function update(dt){
             ? Math.atan2(player.y - e.y, player.x - e.x)
             : (md > 0.001 ? Math.atan2(my, mx) : e.facing);
         } else {
-          // 到位等待，但朝玩家，射程内可开火
           e.facing = Math.atan2(player.y - e.y, player.x - e.x);
         }
       } else {
-        // 进攻阶段：绕后组一起压上
         if (dToP > 80){
           const dx = player.x - e.x, dy = player.y - e.y;
           const d2 = Math.hypot(dx, dy) || 1;
@@ -464,7 +489,6 @@ function update(dt){
         e.facing = Math.atan2(player.y - e.y, player.x - e.x);
       }
     } else {
-      // 正面：直接压上，不等队友
       e.facing = Math.atan2(player.y - e.y, player.x - e.x);
       if (dToP > 120){
         const dx = player.x - e.x, dy = player.y - e.y;
@@ -650,6 +674,9 @@ function drawEnemyShots(){
 function xrayBtnRect(){
   return { x: W - 12 - 74, y: 12, w: 74, h: 30 };
 }
+function aimbotBtnRect(){
+  return { x: W - 12 - 74, y: 50, w: 74, h: 30 };
+}
 
 function drawMinimap(){
   const s = MM_SIZE / WORLD;
@@ -746,19 +773,31 @@ function drawMinimap(){
   ctx.restore();
 }
 
-function drawXrayButton(){
-  const b = xrayBtnRect();
+function drawButtons(){
+  // 透视按钮
+  const b1 = xrayBtnRect();
   ctx.fillStyle = xrayOn ? 'rgba(80,200,255,0.25)' : 'rgba(255,255,255,0.08)';
-  ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.fillRect(b1.x, b1.y, b1.w, b1.h);
   ctx.strokeStyle = xrayOn ? 'rgba(120,220,255,0.85)' : 'rgba(255,255,255,0.28)';
   ctx.lineWidth = 1.5;
-  ctx.strokeRect(b.x, b.y, b.w, b.h);
+  ctx.strokeRect(b1.x, b1.y, b1.w, b1.h);
 
   ctx.fillStyle = xrayOn ? '#8fe3ff' : 'rgba(255,255,255,0.65)';
   ctx.font = 'bold 13px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(xrayOn ? '透视 ON' : '透视 OFF', b.x + b.w/2, b.y + b.h/2);
+  ctx.fillText(xrayOn ? '透视 ON' : '透视 OFF', b1.x + b1.w/2, b1.y + b1.h/2);
+  
+  // 自瞄按钮
+  const b2 = aimbotBtnRect();
+  ctx.fillStyle = aimbotOn ? 'rgba(255,100,100,0.25)' : 'rgba(255,255,255,0.08)';
+  ctx.fillRect(b2.x, b2.y, b2.w, b2.h);
+  ctx.strokeStyle = aimbotOn ? 'rgba(255,120,120,0.85)' : 'rgba(255,255,255,0.28)';
+  ctx.strokeRect(b2.x, b2.y, b2.w, b2.h);
+
+  ctx.fillStyle = aimbotOn ? '#ff9f9f' : 'rgba(255,255,255,0.65)';
+  ctx.fillText(aimbotOn ? '自瞄 ON' : '自瞄 OFF', b2.x + b2.w/2, b2.y + b2.h/2);
+
   ctx.textBaseline = 'alphabetic';
   ctx.textAlign = 'left';
 }
@@ -823,7 +862,7 @@ function draw(){
   drawEnemyMarkers();
   drawThreat();
   drawMinimap();
-  drawXrayButton();
+  drawButtons();
 
   const hudY = MM_Y + MM_SIZE + 22;
   ctx.fillStyle = '#fff';
@@ -913,10 +952,18 @@ requestAnimationFrame(loop);
 cv.addEventListener('pointerdown', e => {
   e.preventDefault();
 
-  const b = xrayBtnRect();
-  if (e.clientX >= b.x && e.clientX <= b.x + b.w &&
-      e.clientY >= b.y && e.clientY <= b.y + b.h){
+  // 检查透视按钮
+  const b1 = xrayBtnRect();
+  if (e.clientX >= b1.x && e.clientX <= b1.x + b1.w &&
+      e.clientY >= b1.y && e.clientY <= b1.y + b1.h){
     xrayOn = !xrayOn;
+    return;
+  }
+  // 检查自瞄按钮
+  const b2 = aimbotBtnRect();
+  if (e.clientX >= b2.x && e.clientX <= b2.x + b2.w &&
+      e.clientY >= b2.y && e.clientY <= b2.y + b2.h){
+    aimbotOn = !aimbotOn;
     return;
   }
 
